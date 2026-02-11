@@ -1,0 +1,34 @@
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Tesseract bundled
+tesseract/
+
+# Logs
+*.log
