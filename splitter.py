@@ -340,6 +340,13 @@ class NLPConfig:
     account_confidence_threshold: float = 0.4
 
 
+class SplitStrategy(Enum):
+    """Strategy used to determine how pages are grouped into splits"""
+    INTELLIGENT = 1          # NLP-based automatic detection (default)
+    MANUAL_ENTITY_TYPE = 2   # User selects entity type from dialog
+    ANCHOR_LIST_OVERRIDE = 3 # User provides explicit pipe-separated entity values
+
+
 @dataclass
 class ValidatedEntity:
     """An entity extracted with validation and confidence scoring"""
@@ -488,29 +495,33 @@ class DocumentIntelligence:
         entities = []
 
         if not self.nlp:
-            # Fallback to regex-based extraction with context validation
-            return self._regex_extraction_with_context(text, page_num, debug_callback)
+            regex_entities = self._regex_extraction_with_context(text, page_num, debug_callback)
+            table_entities = self._extract_from_table_structure(text, page_num, debug_callback)
+            return self._merge_entities(regex_entities, table_entities)
 
         # Process with spaCy
         doc = self.nlp(text)
 
-        # Extract from matcher patterns
+        # Extract from spaCy matcher patterns
         matches = self.matcher(doc)
         for match_id, start, end in matches:
             rule_name = self.nlp.vocab.strings[match_id]
             span = doc[start:end]
-
-            entity = self._create_entity_from_match(
-                rule_name, span, text, page_num
-            )
+            entity = self._create_entity_from_match(rule_name, span, text, page_num)
             if entity and entity.confidence >= self.config.confidence_threshold:
                 entities.append(entity)
 
         # Also extract using regex with context validation
         regex_entities = self._regex_extraction_with_context(text, page_num, debug_callback)
 
-        # Merge and deduplicate
-        all_entities = self._merge_entities(entities, regex_entities)
+        # And column-aligned table extraction
+        table_entities = self._extract_from_table_structure(text, page_num, debug_callback)
+
+        # Merge all three sources and deduplicate
+        all_entities = self._merge_entities(
+            self._merge_entities(entities, regex_entities),
+            table_entities
+        )
 
         return all_entities
 
@@ -558,7 +569,15 @@ class DocumentIntelligence:
                                         debug_callback=None) -> List[ValidatedEntity]:
         """
         Regex-based extraction with strict context validation.
-        Only extracts when proper labels are present.
+
+        Pattern tuples are (regex, entity_type, has_label):
+          has_label=True  → pattern includes an explicit label token (Account:, Meter No, etc.)
+                            → +0.35 confidence bonus
+          has_label=False → standalone / structure-only pattern (no semantic label)
+                            → no bonus; must clear threshold on format+context alone
+
+        Vertical patterns (\n in regex) receive a 300-char backward context window so
+        the label on the previous line is captured for confidence scoring.
         """
         entities = []
 
@@ -566,126 +585,71 @@ class DocumentIntelligence:
             if debug_callback:
                 debug_callback(msg)
 
-        # Account number patterns with required context
-        # Minimum length reduced to 1 to support short account numbers like "83"
+        # ── Account patterns ─────────────────────────────────────────────────
+        # (pattern, entity_type, has_label)
+        # Space-separated numbers (e.g. "6699 090") captured with (?:\s[0-9]+)*
         account_patterns = [
-            # Standard account patterns - allow 1-20 characters when label is present (HORIZONTAL)
-            (r'(?:Account|Acct\.?|A/C)\s*(?:Number|No\.?|#|Num)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            (r'Customer\s*(?:ID|Number|No\.?|#|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            (r'Service\s*Account\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            (r'Contract\s*(?:Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            # Utility-specific patterns (for gas/electric bills)
-            (r'Utility\s*Account\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            (r'(?:BG&E|BGE|Utility)\s*(?:Account|Acct)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            # Sprague and energy company specific patterns
-            (r'Sprague\s*Customer\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            # Generic "XXX Number:" patterns (e.g., "Account Number:", "Customer Number:")
-            (r'(?:Account|Customer|Client|Member)\s+(?:Number|No\.?|#|ID)\s*[:\-]\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            # STANDALONE account pattern: matches formats like "003-7652.300" when on its own line or with minimal context
-            # Must have 3 digits, hyphen, 4 digits, period, 3 digits (common utility account format)
-            (r'(?:^|\s|[|])\s*([0-9]{3}-[0-9]{4}\.[0-9]{3})(?:\s|[|]|$)', EntityType.ACCOUNT_NUMBER),
-            # VERTICAL layout patterns - label on one line, value on next line
-            (r'(?:Account|Acct)\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-            (r'Customer\s*(?:ID|Number|No\.?|#|Code)\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-
-            # TABLE HEADER fallback: "Account Number" followed by other column headers, value in next line
-            (r'(?:Account|Acct)\s*(?:Number|No\.?|#)\s+(?:Meter|Service|Name|Address|Type).*?\n\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-
-            # "ACCOUNT NUMBER:" at start of line (common in summary invoices)
-            (r'ACCOUNT\s+NUMBER\s*[:\-]\s*([A-Z0-9\-]{1,20})', EntityType.ACCOUNT_NUMBER),
-
-            # Budget Number patterns (utility-specific identifier)
-            (r'Budget\s+Nbr\s*\(?s?\)?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.ACCOUNT_NUMBER),
-            (r'Budget\s+Number\s*\(?s?\)?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.ACCOUNT_NUMBER),
-            (r'Budget\s+No\.?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.ACCOUNT_NUMBER),
-            # Table format: "Budget Nbr(s)" followed by value (possibly with whitespace separator)
-            (r'Budget\s+Nbr.*?\n\s*([0-9]+(?:\s+[0-9]+)?)', EntityType.ACCOUNT_NUMBER),
+            # HORIZONTAL – explicit label on same line
+            (r'(?:Account|Acct\.?|A/C)\s*(?:Number|No\.?|#|Num)?\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Customer\s*(?:ID|Number|No\.?|#|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Service\s*Account\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Contract\s*(?:Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Utility\s*Account\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'(?:BG&E|BGE|Utility)\s*(?:Account|Acct)\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Sprague\s*Customer\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'(?:Account|Customer|Client|Member)\s+(?:Number|No\.?|#|ID)\s*[:\-]\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'ACCOUNT\s+NUMBER\s*[:\-]\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            # Budget Number (horizontal)
+            (r'Budget\s+(?:Nbr|Number|No\.?)\s*\(?s?\)?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.ACCOUNT_NUMBER, True),
+            # VERTICAL – label on previous line, value on next
+            (r'(?:Account|Acct)\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Customer\s*(?:ID|Number|No\.?|#|Code)\s*\n\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            (r'Budget\s+(?:Nbr|Number|No\.?)\s*\n\s*([0-9]+(?:\s+[0-9]+)?)', EntityType.ACCOUNT_NUMBER, True),
+            # TABLE HEADER – "Account Number  <other header>" then value on next line
+            (r'(?:Account|Acct)\s*(?:Number|No\.?|#)\s+(?:Meter|Service|Name|Address|Type)[^\n]*\n\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.ACCOUNT_NUMBER, True),
+            # STANDALONE – utility dotted format "003-7652.300" (no label required → has_label=False)
+            (r'(?:^|\s|[|])\s*([0-9]{3}-[0-9]{4}\.[0-9]{3})(?:\s|[|]|$)', EntityType.ACCOUNT_NUMBER, False),
         ]
 
-        # Meter patterns - handles both ADJACENT (label+value on same line) and TABLE HEADER (label in header row, value in data row)
+        # ── Meter patterns ────────────────────────────────────────────────────
         meter_patterns = [
-            # ===== ADJACENT / INLINE patterns (label and value on same line) =====
-
-            # Direct meter number after "Meter No." in same cell/line
-            (r'Meter\s*No\.?\s*[:\-]?\s*([0-9]{5,12})(?:\s|$|\n)', EntityType.METER_NUMBER),
-
-            # HORIZONTAL patterns - meter number directly after label
-            (r'Meter\s*(?:Number|#|Num)\s*[:\-]?\s*([A-Z0-9\-]{5,20})', EntityType.METER_NUMBER),
-
-            # Generic meter number with label (no other text after number)
-            (r'Meter\s*[:\-]?\s*([0-9]{5,12})(?:\s+\d|$|\n)', EntityType.METER_NUMBER),
-
-            # ===== TABLE HEADER patterns (label is column header, value in data row below) =====
-
-            # "Meter Number" header followed by other column headers, then value on next line
-            # Handles: "Meter Number  Usage Period  Current Reading...\n  211302  01/01/2026..."
-            (r'Meter\s+Number\s+(?:Usage|Current|Previous|Reading|Period|Multiplier).*?\n\s*(\d{5,12})', EntityType.METER_NUMBER),
-
-            # "Meter Number" header followed by value on next line (simple vertical)
-            (r'Meter\s+Number\s*\n+\s*([0-9]{5,20})', EntityType.METER_NUMBER),
-
-            # "Meter No." header followed by other columns, then value on next line
-            (r'Meter\s*No\.?\s+(?:Usage|Current|Previous|Reading|Period|Multiplier|Type|Class).*?\n\s*(\d{5,12})', EntityType.METER_NUMBER),
-
-            # ===== VERTICAL layout patterns (label on one line, value on next) =====
-            (r'Meter\s*(?:Number|No\.?|#|Num)?\s*\n\s*([0-9]{5,20})', EntityType.METER_NUMBER),
-
-            # ===== TABLE ROW patterns (for structured data rows) =====
-
-            # Rate class (3 digits) followed by meter number (8-12 digits) then date
-            (r'(?:^|\n)\s*0[0-9]{2}\s+([0-9]{8,12})\s+\d{2}/\d{2}/\d{4}', EntityType.METER_NUMBER),
-
-            # 3-digit number (rate class) followed by 5-12 digit meter number in table row
-            (r'(?:^|\n)\s*[0-9]{3}\s+([0-9]{5,12})\s+', EntityType.METER_NUMBER),
-
-            # FALLBACK: After "Type" or "Reading" header, capture meter number in data row
-            (r'(?:Type|Reading)\s+[^\n]*?\n\s*[0-9]{2,3}\s+([0-9]{5,12})', EntityType.METER_NUMBER),
-
-            # Context clue patterns
-            (r'(?:Days\s+(?:Billed|Served)|Current\s+Reading)\s+[^\n]*\n[^\n]*?([0-9]{5,12})', EntityType.METER_NUMBER),
+            # HORIZONTAL / INLINE – label on same line
+            (r'Meter\s*No\.?\s*[:\-]?\s*([0-9]{5,12})(?:\s|$|\n)', EntityType.METER_NUMBER, True),
+            (r'Meter\s*(?:Number|#|Num)\s*[:\-]?\s*([A-Z0-9\-]{5,20})', EntityType.METER_NUMBER, True),
+            (r'Meter\s*[:\-]?\s*([0-9]{5,12})(?:\s+\d|$|\n)', EntityType.METER_NUMBER, True),
+            # TABLE HEADER – label + adjacent headers, value below
+            (r'Meter\s+Number\s+(?:Usage|Current|Previous|Reading|Period|Multiplier)[^\n]*\n\s*(\d{5,12})', EntityType.METER_NUMBER, True),
+            (r'Meter\s+Number\s*\n+\s*([0-9]{5,20})', EntityType.METER_NUMBER, True),
+            (r'Meter\s*No\.?\s+(?:Usage|Current|Previous|Reading|Period|Multiplier|Type|Class)[^\n]*\n\s*(\d{5,12})', EntityType.METER_NUMBER, True),
+            # VERTICAL – label on previous line
+            (r'Meter\s*(?:Number|No\.?|#|Num)?\s*\n\s*([0-9]{5,20})', EntityType.METER_NUMBER, True),
+            # TABLE ROW – rate class (3 digits) + meter number + date  (has_label=False: structure only)
+            (r'(?:^|\n)\s*0[0-9]{2}\s+([0-9]{8,12})\s+\d{2}/\d{2}/\d{4}', EntityType.METER_NUMBER, False),
+            # Context clue – "Days Billed/Served" or "Current Reading" followed by meter in next line
+            (r'(?:Days\s+(?:Billed|Served)|Current\s+Reading)\s+[^\n]*\n[^\n]*?([0-9]{5,12})', EntityType.METER_NUMBER, False),
         ]
 
-        # Meter with Address pattern (for invoices like "Meter: 123456  123 Main St, City, ST 12345")
-        # This captures meter number and its associated address together
+        # ── Meter + Address pairs ─────────────────────────────────────────────
         meter_address_patterns = [
-            # Pattern: "Meter:" + meter_number + whitespace + address ending with ZIP code
-            # Use non-greedy match for address part to stop at ZIP code
             (r'Meter\s*[:\-]?\s*([A-Z0-9]{8,20})\s+(\d+\s+[A-Z][A-Za-z0-9\s,\.\-]+?[A-Z]{2}\s+\d{5}(?:-\d{4})?)', 'METER_WITH_ADDRESS'),
-            # Simpler pattern: capture everything from street number to 5-digit ZIP
             (r'Meter\s*[:\-]?\s*([A-Z0-9]{8,20})\s+(\d+[^\n\r]+?\d{5})', 'METER_WITH_ADDRESS'),
-            # Table format: Service Address on one line/section, then Meter Number below it
-            # This catches: "Service Address ... [address] ... Meter Number [meter]"
             (r'(?:Service\s+Address|^\s*[0-9]+\s+[\w\s]+(?:RD|ST|AVE|ROAD|STREET|AVENUE)[^\n]*)\s+[A-Z0-9\-]{1,20}\s+Meter\s+Number\s*\n?\s*([0-9]{8,20})', 'METER_WITH_ADDRESS'),
-            # Table/Box format: Meter Number label followed by number in next section
-            # Captures meter number that appears after "Meter Number" label (even if separated by table cell)
             (r'Meter\s+Number\s+([0-9]{8,20})\s+(?:Days|Current)', 'METER_WITH_ADDRESS'),
         ]
 
-        # Extract meter-address pairs first (special handling)
-        # IMPORTANT: Accept ALL meters with addresses, even low-confidence ones, for unique address counting
+        # Extract meter-address pairs first (accept all confidence levels for address mapping)
         for pattern, pattern_type in meter_address_patterns:
-            matches_found = list(re.finditer(pattern, text, re.IGNORECASE))
-            if matches_found:
-                debug_log(f"    [DEBUG] Meter+Address pattern found {len(matches_found)} matches")
-            for match in matches_found:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
                 meter_num = match.group(1)
                 address = match.group(2).strip()
-                debug_log(f"    [DEBUG] Meter-Address pair: meter='{meter_num}', address='{address[:50]}...'")
-
-                # Create meter entity
+                debug_log(f"    [DEBUG] Meter-Address pair: meter='{meter_num}', address='{address[:50]}'")
                 if self._validate_entity_value(EntityType.METER_NUMBER, meter_num):
-                    # Include address in context for later processing
-                    context_start = max(0, match.start() - self.config.context_window)
-                    context_end = min(len(text), match.end() + self.config.context_window)
-                    context = text[context_start:context_end]
-
+                    ctx_start = max(0, match.start() - self.config.context_window)
+                    ctx_end   = min(len(text), match.end() + self.config.context_window)
+                    context   = text[ctx_start:ctx_end]
                     confidence = self._calculate_entity_confidence(
                         EntityType.METER_NUMBER, meter_num, context, has_label=True
                     )
-
-                    # ACCEPT ALL meters with addresses, regardless of confidence threshold
-                    # The threshold is enforced later during split generation, not during extraction
-                    # Store the associated address in the raw_value for later processing
                     entities.append(ValidatedEntity(
                         entity_type=EntityType.METER_NUMBER,
                         value=meter_num.upper(),
@@ -696,277 +660,237 @@ class DocumentIntelligence:
                         position=(match.start(), match.end()),
                         has_label=True
                     ))
-                    debug_log(f"    [DEBUG] ACCEPTED meter with address: {meter_num} -> {address[:40]} (confidence: {confidence:.2f})")
+                    debug_log(f"    [DEBUG] ACCEPTED meter+addr: {meter_num} -> {address[:40]} (conf: {confidence:.2f})")
 
-        # Invoice patterns
+        # ── Invoice patterns ──────────────────────────────────────────────────
         invoice_patterns = [
-            (r'Invoice\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,25})', EntityType.INVOICE_NUMBER),
-            (r'Bill\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,25})', EntityType.INVOICE_NUMBER),
+            (r'Invoice\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,25})', EntityType.INVOICE_NUMBER, True),
+            (r'Bill\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,25})', EntityType.INVOICE_NUMBER, True),
         ]
 
-        # POD (Point of Delivery) and other delivery point patterns - unique location identifiers in utility bills
-        # Covers: POD, Meter Point, LDC, Supplier, EAN, MPAN, Supply Point, Service Point, Service Delivery Point, etc.
+        # ── POD / delivery-point patterns ─────────────────────────────────────
+        # LDC and Supplier are now mapped to their own entity types (Fix #9)
         pod_patterns = [
-            # Point of Delivery variations (HORIZONTAL)
-            (r'(?:Point\s+of\s+(?:Delivery|Delivery)|POD\s+(?:ID|Number|No\.?|#)?|Delivery\s+Point)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'POD\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Point\s+of\s+delivery\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # Meter Point / Meter Point Administration Number (MPAN) - UK utility standard
-            (r'(?:Meter\s+Point|MPAN|Meter\s+Point\s+Admin(?:istration)?)\s*(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'MPAN\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # LDC (Local Distribution Company) number
-            (r'LDC\s+(?:Number|No\.?|#|ID|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'LDC\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # Supplier number
-            (r'Supplier\s+(?:Number|No\.?|#|ID|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Supplier\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # EAN (European Article Number) - used in some utility billing systems
-            (r'EAN\s+(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([0-9]{1,20})', EntityType.POD_ID),
-            (r'EAN\s*[:\-]?\s*([0-9]{1,20})', EntityType.POD_ID),
-
-            # Supply Point or Service Point variations
-            (r'(?:Supply|Service)\s+(?:Point|Location)\s+(?:Number|No\.?|#|ID|Code)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'(?:Supply|Service|Delivery)\s+(?:Point|Location)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # Service Delivery Point
-            (r'Service\s+Delivery\s+Point\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # Generic location/terminal identifiers
-            (r'(?:Service|Delivery)\s+Terminal\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Location\s+(?:ID|Number|No\.?|Code|Reference)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # VERTICAL layout patterns - label on one line, value on next line
-            (r'POD\s*(?:ID|Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Point\s+of\s+[Dd]elivery\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'LDC\s*(?:Number|No\.?|#|ID|Code)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Supplier\s*(?:Number|No\.?|#|ID|Code)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-            (r'Supply\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID),
-
-            # Location patterns - "Location: 0261047600" or "Loc: 1420-30-7600-02" format
-            # This is a common format for utility location identifiers
-            (r'Location\s*[:\-]\s*([0-9]{6,20})', EntityType.POD_ID),
-            (r'Location\s*[:\-]\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID),
-            (r'Loc\s*[:\-#]\s*([0-9]{6,20})', EntityType.POD_ID),
-            # Loc with hyphenated values like "Loc: 1420-30-7600-02"
-            (r'Loc\s*[:\-#]\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID),
-            # VERTICAL layout for Loc
-            (r'Loc\s*[:\-#]?\s*\n\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID),
-        ]
-
-        # Sub-Account Number patterns
-        subaccount_patterns = [
-            # HORIZONTAL patterns
-            (r'Sub\s*(?:[-\s])?Account\s*(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.SUB_ACCOUNT_NUMBER),
-            (r'Sub\s*Account\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.SUB_ACCOUNT_NUMBER),
-            (r'(?:Sub|Secondary)\s+(?:Account|Acct)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.SUB_ACCOUNT_NUMBER),
-            # VERTICAL layout patterns
-            (r'Sub\s*Account\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.SUB_ACCOUNT_NUMBER),
-        ]
-
-        # Service Agreement ID patterns
-        service_agreement_patterns = [
-            (r'Service\s+Agreement\s+(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID),
-            (r'Service\s+Agreement\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID),
-            (r'Agreement\s+(?:ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID),
-            (r'SAID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID),
-        ]
-
-        # Service ID patterns
-        service_id_patterns = [
-            (r'Service\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_ID),
-            (r'Service\s*[:\-]?\s*([A-Z0-9\-]{6,20})(?:\s+(?:address|location|phone))', EntityType.SERVICE_ID),
-        ]
-
-        # Contract ID patterns
-        contract_id_patterns = [
-            (r'Contract\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CONTRACT_ID),
-            (r'(?:Contract|Facility)\s*(?:ID|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CONTRACT_ID),
-        ]
-
-        # Premise ID patterns
-        premise_id_patterns = [
-            (r'Premise\s+(?:ID|Identifier|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID),
-            (r'Premises\s*(?:ID|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID),
-            (r'Property\s+(?:ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID),
-        ]
-
-        # ESI ID patterns (Electric Service Identifier - Texas, 17 or 22 digits)
-        esi_id_patterns = [
-            (r'ESI\s*(?:ID|#)?\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID),
-            (r'ESIID\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID),
-            (r'Electric\s+Service\s+(?:Identifier|ID)\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID),
-            (r'ESI\s+Number\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID),
-            # VERTICAL layout
-            (r'ESI\s*(?:ID|#)?\s*\n\s*(\d{17,22})', EntityType.ESI_ID),
-            (r'ESIID\s*\n\s*(\d{17,22})', EntityType.ESI_ID),
-        ]
-
-        # SAID patterns (Service Account ID - California, typically 10 digits)
-        said_patterns = [
-            (r'SAID\s*[:\-]?\s*(\d{10})', EntityType.SAID),
-            (r'Service\s+Account\s+ID\s*[:\-]?\s*(\d{10})', EntityType.SAID),
-            (r'SA\s*ID\s*[:\-]?\s*(\d{10})', EntityType.SAID),
-            # VERTICAL layout
-            (r'SAID\s*\n\s*(\d{10})', EntityType.SAID),
-        ]
-
-        # SDI patterns (Service Delivery Identifier - Ohio, 17 digits)
-        sdi_patterns = [
-            (r'SDI\s*[:\-]?\s*(\d{17})', EntityType.SDI),
-            (r'Service\s+Delivery\s+(?:Identifier|ID)\s*[:\-]?\s*(\d{17})', EntityType.SDI),
-            (r'SD\s*ID\s*[:\-]?\s*(\d{17})', EntityType.SDI),
-            # VERTICAL layout
-            (r'SDI\s*\n\s*(\d{17})', EntityType.SDI),
-        ]
-
-        # Customer Number / Customer ID patterns
-        customer_number_patterns = [
-            (r'Customer\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_NUMBER),
-            (r'Cust\s*(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_NUMBER),
-            (r'Customer\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID),
-            (r'Cust\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID),
-            (r'CID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID),
-            # VERTICAL layout
-            (r'Customer\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_NUMBER),
-            (r'Customer\s*ID\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID),
-        ]
-
-        # Budget Number patterns
-        budget_number_patterns = [
-            (r'Budget\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER),
-            (r'Budget\s+Nbr\s*\(?s?\)?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER),
-            (r'Budget\s+Nbr.*?\n\s*([0-9]+(?:\s+[0-9]+)?)', EntityType.BUDGET_NUMBER),
-            # VERTICAL layout
-            (r'Budget\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER),
-        ]
-
-        # Contract / Deal / Plan / Agreement Number patterns
-        contract_deal_patterns = [
-            # Contract Number
-            (r'Contract\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER),
-            (r'Contract\s*#\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER),
-            # Deal Number
-            (r'Deal\s+(?:Number|No\.?|#|Nbr|ID)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER),
-            (r'Deal\s*#\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER),
-            # Plan Number
-            (r'Plan\s+(?:Number|No\.?|#|Nbr|ID)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER),
-            (r'Rate\s+Plan\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER),
-            (r'Plan\s*#\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER),
-            # Agreement Number
-            (r'Agreement\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.AGREEMENT_NUMBER),
-            (r'Agmt\s*(?:Number|No\.?|#|Nbr)?\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.AGREEMENT_NUMBER),
+            # POD – Point of Delivery
+            (r'(?:Point\s+of\s+(?:Delivery)|POD\s+(?:ID|Number|No\.?|#)?|Delivery\s+Point)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'POD\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'Point\s+of\s+[Dd]elivery\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            # MPAN
+            (r'(?:Meter\s+Point|MPAN|Meter\s+Point\s+Admin(?:istration)?)\s*(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'MPAN\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            # LDC → correct entity type
+            (r'LDC\s+(?:Number|No\.?|#|ID|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.LDC_NUMBER, True),
+            (r'LDC\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.LDC_NUMBER, True),
+            # Supplier → correct entity type
+            (r'Supplier\s+(?:Number|No\.?|#|ID|Code)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.SUPPLIER_NUMBER, True),
+            (r'Supplier\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.SUPPLIER_NUMBER, True),
+            # EAN
+            (r'EAN\s+(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([0-9]{1,20})', EntityType.POD_ID, True),
+            (r'EAN\s*[:\-]?\s*([0-9]{1,20})', EntityType.POD_ID, True),
+            # Supply / Service Point
+            (r'(?:Supply|Service)\s+(?:Point|Location)\s+(?:Number|No\.?|#|ID|Code)?\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'(?:Supply|Service|Delivery)\s+(?:Point|Location)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'Service\s+Delivery\s+Point\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'(?:Service|Delivery)\s+Terminal\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'Location\s+(?:ID|Number|No\.?|Code|Reference)\s*[:\-]?\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            # Location / Loc shorthand
+            (r'Location\s*[:\-]\s*([0-9]{6,20})', EntityType.POD_ID, True),
+            (r'Location\s*[:\-]\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID, True),
+            (r'Loc\s*[:\-#]\s*([0-9]{6,20})', EntityType.POD_ID, True),
+            (r'Loc\s*[:\-#]\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID, True),
             # VERTICAL layouts
-            (r'Contract\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER),
-            (r'Deal\s+(?:Number|No\.?|#|Nbr|ID)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER),
-            (r'Plan\s+(?:Number|No\.?|#|Nbr|ID)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER),
+            (r'POD\s*(?:ID|Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'Point\s+of\s+[Dd]elivery\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'LDC\s*(?:Number|No\.?|#|ID|Code)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.LDC_NUMBER, True),
+            (r'Supplier\s*(?:Number|No\.?|#|ID|Code)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.SUPPLIER_NUMBER, True),
+            (r'Supply\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20})', EntityType.POD_ID, True),
+            (r'Loc\s*[:\-#]?\s*\n\s*([A-Z0-9\-]{6,20})', EntityType.POD_ID, True),
         ]
 
-        # Premise Number / Facility ID patterns
+        # ── Sub-Account patterns ──────────────────────────────────────────────
+        subaccount_patterns = [
+            (r'Sub\s*(?:[-\s])?Account\s*(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.SUB_ACCOUNT_NUMBER, True),
+            (r'Sub\s*Account\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.SUB_ACCOUNT_NUMBER, True),
+            (r'(?:Sub|Secondary)\s+(?:Account|Acct)\s*[:\-]?\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.SUB_ACCOUNT_NUMBER, True),
+            (r'Sub\s*Account\s*(?:Number|No\.?|#)?\s*\n\s*([A-Z0-9\-]{1,20}(?:\s[0-9]+)*)', EntityType.SUB_ACCOUNT_NUMBER, True),
+        ]
+
+        # ── Service Agreement patterns (SAID removed – has its own dedicated block) ──
+        service_agreement_patterns = [
+            (r'Service\s+Agreement\s+(?:Number|No\.?|#|ID)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID, True),
+            (r'Service\s+Agreement\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID, True),
+            (r'Agreement\s+(?:ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_AGREEMENT_ID, True),
+            # SAID removed from here – its dedicated said_patterns block handles it correctly
+        ]
+
+        # ── Service ID patterns ───────────────────────────────────────────────
+        service_id_patterns = [
+            (r'Service\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.SERVICE_ID, True),
+            (r'Service\s*[:\-]?\s*([A-Z0-9\-]{6,20})(?:\s+(?:address|location|phone))', EntityType.SERVICE_ID, True),
+        ]
+
+        # ── Contract ID patterns ──────────────────────────────────────────────
+        contract_id_patterns = [
+            (r'Contract\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CONTRACT_ID, True),
+            (r'(?:Contract|Facility)\s*(?:ID|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CONTRACT_ID, True),
+        ]
+
+        # ── Premise ID patterns ───────────────────────────────────────────────
+        premise_id_patterns = [
+            (r'Premise\s+(?:ID|Identifier|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID, True),
+            (r'Premises\s*(?:ID|Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID, True),
+            (r'Property\s+(?:ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_ID, True),
+        ]
+
+        # ── ESI ID (Texas, 17 or 22 digits) ──────────────────────────────────
+        esi_id_patterns = [
+            (r'ESI\s*(?:ID|#)?\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID, True),
+            (r'ESIID\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID, True),
+            (r'Electric\s+Service\s+(?:Identifier|ID)\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID, True),
+            (r'ESI\s+Number\s*[:\-]?\s*(\d{17,22})', EntityType.ESI_ID, True),
+            (r'ESI\s*(?:ID|#)?\s*\n\s*(\d{17,22})', EntityType.ESI_ID, True),
+            (r'ESIID\s*\n\s*(\d{17,22})', EntityType.ESI_ID, True),
+        ]
+
+        # ── SAID (California, 10 digits) ──────────────────────────────────────
+        said_patterns = [
+            (r'SAID\s*[:\-]?\s*(\d{10})', EntityType.SAID, True),
+            (r'Service\s+Account\s+ID\s*[:\-]?\s*(\d{10})', EntityType.SAID, True),
+            (r'SA\s*ID\s*[:\-]?\s*(\d{10})', EntityType.SAID, True),
+            (r'SAID\s*\n\s*(\d{10})', EntityType.SAID, True),
+        ]
+
+        # ── SDI (Ohio, 17 digits) ─────────────────────────────────────────────
+        sdi_patterns = [
+            (r'SDI\s*[:\-]?\s*(\d{17})', EntityType.SDI, True),
+            (r'Service\s+Delivery\s+(?:Identifier|ID)\s*[:\-]?\s*(\d{17})', EntityType.SDI, True),
+            (r'SD\s*ID\s*[:\-]?\s*(\d{17})', EntityType.SDI, True),
+            (r'SDI\s*\n\s*(\d{17})', EntityType.SDI, True),
+        ]
+
+        # ── Customer Number / ID ──────────────────────────────────────────────
+        customer_number_patterns = [
+            (r'Customer\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20}(?:\s[0-9]+)*)', EntityType.CUSTOMER_NUMBER, True),
+            (r'Cust\s*(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20}(?:\s[0-9]+)*)', EntityType.CUSTOMER_NUMBER, True),
+            (r'Customer\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID, True),
+            (r'Cust\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID, True),
+            (r'CID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID, True),
+            (r'Customer\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,20}(?:\s[0-9]+)*)', EntityType.CUSTOMER_NUMBER, True),
+            (r'Customer\s*ID\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.CUSTOMER_ID, True),
+        ]
+
+        # ── Budget Number ─────────────────────────────────────────────────────
+        budget_number_patterns = [
+            (r'Budget\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER, True),
+            (r'Budget\s+Nbr\s*\(?s?\)?\s*[:\-]?\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER, True),
+            (r'Budget\s+Nbr[^\n]*\n\s*([0-9]+(?:\s+[0-9]+)?)', EntityType.BUDGET_NUMBER, True),
+            (r'Budget\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-\s]{1,25})', EntityType.BUDGET_NUMBER, True),
+        ]
+
+        # ── Contract / Deal / Plan / Agreement ───────────────────────────────
+        contract_deal_patterns = [
+            (r'Contract\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER, True),
+            (r'Contract\s*#\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER, True),
+            (r'Deal\s+(?:Number|No\.?|#|Nbr|ID)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER, True),
+            (r'Deal\s*#\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER, True),
+            (r'Plan\s+(?:Number|No\.?|#|Nbr|ID)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER, True),
+            (r'Rate\s+Plan\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER, True),
+            (r'Plan\s*#\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER, True),
+            (r'Agreement\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.AGREEMENT_NUMBER, True),
+            (r'Agmt\s*(?:Number|No\.?|#|Nbr)?\s*[:\-]?\s*([A-Z0-9\-]{4,25})', EntityType.AGREEMENT_NUMBER, True),
+            (r'Contract\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.CONTRACT_NUMBER, True),
+            (r'Deal\s+(?:Number|No\.?|#|Nbr|ID)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.DEAL_NUMBER, True),
+            (r'Plan\s+(?:Number|No\.?|#|Nbr|ID)\s*\n\s*([A-Z0-9\-]{4,25})', EntityType.PLAN_NUMBER, True),
+        ]
+
+        # ── Premise Number / Facility ID ──────────────────────────────────────
         premise_facility_patterns = [
-            (r'Premise\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER),
-            (r'Prem\s*(?:Number|No\.?|#|Nbr)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER),
-            (r'Facility\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID),
-            (r'Fac\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID),
-            # VERTICAL layout
-            (r'Premise\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER),
-            (r'Facility\s+(?:ID|Identifier|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID),
+            (r'Premise\s+(?:Number|No\.?|#|Nbr)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER, True),
+            (r'Prem\s*(?:Number|No\.?|#|Nbr)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER, True),
+            (r'Facility\s+(?:ID|Identifier|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID, True),
+            (r'Fac\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID, True),
+            (r'Premise\s+(?:Number|No\.?|#|Nbr)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.PREMISE_NUMBER, True),
+            (r'Facility\s+(?:ID|Identifier|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.FACILITY_ID, True),
         ]
 
-        # Provider patterns (ESP/REP/CRES)
+        # ── Provider patterns (ESP / REP / CRES) ─────────────────────────────
         provider_patterns = [
-            # ESP (Electric Service Provider)
-            (r'ESP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT),
-            (r'Electric\s+Service\s+Provider\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT),
-            # REP (Retail Electric Provider - Texas)
-            (r'REP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER),
-            (r'Retail\s+Electric\s+Provider\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER),
-            (r'REP\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER),
-            # CRES (Competitive Retail Electric Service - Ohio)
-            (r'CRES\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT),
-            (r'CRES\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT),
-            (r'Competitive\s+Retail\s+Electric\s*(?:Service)?\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT),
-            # VERTICAL layout
-            (r'ESP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT),
-            (r'REP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER),
-            (r'CRES\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT),
+            (r'ESP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT, True),
+            (r'Electric\s+Service\s+Provider\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT, True),
+            (r'REP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER, True),
+            (r'Retail\s+Electric\s+Provider\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER, True),
+            (r'REP\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER, True),
+            (r'CRES\s+(?:Account|Acct|ID|Number|No\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT, True),
+            (r'CRES\s*ID\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT, True),
+            (r'Competitive\s+Retail\s+Electric\s*(?:Service)?\s*(?:ID|#)?\s*[:\-]?\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT, True),
+            (r'ESP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.ESP_ACCOUNT, True),
+            (r'REP\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.REP_NUMBER, True),
+            (r'CRES\s+(?:Account|Acct|ID|Number|No\.?|#)\s*\n\s*([A-Z0-9\-]{4,20})', EntityType.CRES_ACCOUNT, True),
         ]
 
-        # Service Address patterns - capture full street addresses with road/street indicators
+        # ── Address patterns ──────────────────────────────────────────────────
+        # Label-free street patterns use has_label=False → confidence stays below 0.6 threshold
         address_patterns = [
-            # Addr: shorthand patterns - "Addr: 1420-30-7600-02" (code-style) or "Addr: 123 Main St"
-            # INLINE: code-style address (alphanumeric with hyphens, no street words)
-            (r'Addr\s*[:\-]\s*([A-Z0-9\-]{6,20})', EntityType.SERVICE_ADDRESS),
-            # INLINE: street address after Addr:
-            (r'Addr\s*[:\-]\s*(\d+\s+.{5,80}?)(?:\s{2,}|\t|\n|$)', EntityType.SERVICE_ADDRESS),
-            # VERTICAL: Addr on one line, value on next
-            (r'Addr\s*[:\-]?\s*\n\s*([A-Z0-9\-]{6,20})', EntityType.SERVICE_ADDRESS),
-            (r'Addr\s*[:\-]?\s*\n\s*(\d+\s+.{5,80}?)(?:\n|$)', EntityType.SERVICE_ADDRESS),
-
-            # Site code patterns - "Service Address: SITE#SIG CO WIG-E CREST SER"
-            # These are location identifiers, not traditional street addresses
-            (r'Service\s+Address\s*[:\-]?\s*(SITE[#\s][A-Z0-9\s\-]+)', EntityType.SERVICE_ADDRESS),
-            (r'Service\s+Address\s*[:\-]?\s*([A-Z]{2,}#[A-Z0-9\s\-]+)', EntityType.SERVICE_ADDRESS),
-
-            # NEW FIRST: Ultra-simple direct capture - just street number + name + road type
-            # Matches: "94 YELLOW WATER RD" or "94 YELLOW WATER RD APT RR01" without header garbage
-            (r'([0-9]+\s+[A-Z]+(?:\s+[A-Z]+)*\s+(?:RD|ST|AVE|ROAD|STREET|AVENUE|DRIVE|DR|BLVD|WAY|LANE|COURT|CT|BOULEVARD)(?:\s+(?:APT|SUITE|STE|UNIT)\s+[A-Z0-9]+)?)', EntityType.SERVICE_ADDRESS),
-            # Improved: Capture street addresses (number + street name with road/street/avenue/etc)
-            (r'(\d+\s+[\w\s]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Way|Court|Ct|Circle|Place|Pl)[,\.\s]+[A-Za-z\s]+(?:,?\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)?)', EntityType.SERVICE_ADDRESS),
-            # Service/Premise address labels - but NOT for site codes (handled above)
-            (r'(?:Service|Premise|Property|Location)\s*Address\s*[:\-]?\s*(\d+.{10,100}?)(?:\n|$)', EntityType.SERVICE_ADDRESS),
-            (r'(?:Meter|Service)\s+(?:Location|Address)\s*[:\-]?\s*(\d+.{10,100}?)(?:\n|$)', EntityType.SERVICE_ADDRESS),
-            # RBC address pattern (from your invoice)
-            (r'RBC\s+\n\s*([0-9\-]+\s+[\w\s,]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Way|Court|Ct)[\w\s,]*)', EntityType.SERVICE_ADDRESS),
-            # Table format: Service Address label followed by actual address on same/next line
-            # Captures addresses like "94 YELLOW WATER RD APT RR01" that appear in table cells
-            (r'(?:Service\s+Address|^\s+)([0-9]+\s+[A-Z][A-Za-z0-9\s,\.\-]*(?:RD|RR|APT|AVE|ST|ROAD|STREET|AVENUE|DR|DRIVE)[A-Za-z0-9\s,\.\-]*)', EntityType.SERVICE_ADDRESS),
+            # Addr: shorthand (has label)
+            (r'Addr\s*[:\-]\s*([A-Z0-9\-]{6,20})', EntityType.SERVICE_ADDRESS, True),
+            (r'Addr\s*[:\-]\s*(\d+\s+.{5,80}?)(?:\s{2,}|\t|\n|$)', EntityType.SERVICE_ADDRESS, True),
+            (r'Addr\s*[:\-]?\s*\n\s*([A-Z0-9\-]{6,20})', EntityType.SERVICE_ADDRESS, True),
+            (r'Addr\s*[:\-]?\s*\n\s*(\d+\s+.{5,80}?)(?:\n|$)', EntityType.SERVICE_ADDRESS, True),
+            # Site code formats (has label)
+            (r'Service\s+Address\s*[:\-]?\s*(SITE[#\s][A-Z0-9\s\-]+)', EntityType.SERVICE_ADDRESS, True),
+            (r'Service\s+Address\s*[:\-]?\s*([A-Z]{2,}#[A-Z0-9\s\-]+)', EntityType.SERVICE_ADDRESS, True),
+            # With label: Service/Premise/Location Address (has label)
+            (r'(?:Service|Premise|Property|Location)\s*Address\s*[:\-]?\s*(\d+.{10,100}?)(?:\n|$)', EntityType.SERVICE_ADDRESS, True),
+            (r'(?:Meter|Service)\s+(?:Location|Address)\s*[:\-]?\s*(\d+.{10,100}?)(?:\n|$)', EntityType.SERVICE_ADDRESS, True),
+            (r'RBC\s+\n\s*([0-9\-]+\s+[\w\s,]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Way|Court|Ct)[\w\s,]*)', EntityType.SERVICE_ADDRESS, True),
+            (r'(?:Service\s+Address|^\s+)([0-9]+\s+[A-Z][A-Za-z0-9\s,\.\-]*(?:RD|RR|APT|AVE|ST|ROAD|STREET|AVENUE|DR|DRIVE)[A-Za-z0-9\s,\.\-]*)', EntityType.SERVICE_ADDRESS, True),
+            # Label-free street address patterns → has_label=False (confidence will be too low to pass threshold)
+            (r'([0-9]+\s+[A-Z]+(?:\s+[A-Z]+)*\s+(?:RD|ST|AVE|ROAD|STREET|AVENUE|DRIVE|DR|BLVD|WAY|LANE|COURT|CT|BOULEVARD)(?:\s+(?:APT|SUITE|STE|UNIT)\s+[A-Z0-9]+)?)', EntityType.SERVICE_ADDRESS, False),
+            (r'(\d+\s+[\w\s]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Way|Court|Ct|Circle|Place|Pl)[,\.\s]+[A-Za-z\s]+(?:,?\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)?)', EntityType.SERVICE_ADDRESS, False),
         ]
 
         all_patterns = (account_patterns + meter_patterns + subaccount_patterns +
-                       service_agreement_patterns + service_id_patterns + contract_id_patterns +
-                       premise_id_patterns + esi_id_patterns + said_patterns + sdi_patterns +
-                       customer_number_patterns + budget_number_patterns + contract_deal_patterns +
-                       premise_facility_patterns + provider_patterns +
-                       invoice_patterns + pod_patterns + address_patterns)
+                        service_agreement_patterns + service_id_patterns + contract_id_patterns +
+                        premise_id_patterns + esi_id_patterns + said_patterns + sdi_patterns +
+                        customer_number_patterns + budget_number_patterns + contract_deal_patterns +
+                        premise_facility_patterns + provider_patterns +
+                        invoice_patterns + pod_patterns + address_patterns)
 
         debug_log(f"    [DEBUG] Searching with {len(all_patterns)} patterns...")
 
-        for pattern, entity_type in all_patterns:
-            matches_found = list(re.finditer(pattern, text, re.IGNORECASE))
+        for pattern, entity_type, has_label in all_patterns:
+            matches_found = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE))
             if matches_found:
-                debug_log(f"    [DEBUG] Pattern '{pattern[:50]}...' found {len(matches_found)} matches")
+                debug_log(f"    [DEBUG] Pattern '{pattern[:60]}' found {len(matches_found)} matches")
 
             for match in matches_found:
                 value = match.group(1)
                 debug_log(f"    [DEBUG] Match: '{match.group(0)[:60]}' -> value='{value}'")
 
-                # Validate the value
                 if not self._validate_entity_value(entity_type, value):
                     debug_log(f"    [DEBUG] REJECTED: Failed validation for '{value}'")
                     continue
 
-                # Get context
                 start = match.start()
-                end = match.end()
-                context_start = max(0, start - self.config.context_window)
-                context_end = min(len(text), end + self.config.context_window)
-                context = text[context_start:context_end]
+                end   = match.end()
 
-                # Calculate confidence
+                # Wider backward window for vertical patterns so the label on the
+                # previous line is included in the context for confidence scoring
+                backward = 300 if '\n' in pattern else self.config.context_window
+                ctx_start = max(0, start - backward)
+                ctx_end   = min(len(text), end + self.config.context_window)
+                context   = text[ctx_start:ctx_end]
+
                 confidence = self._calculate_entity_confidence(
-                    entity_type, value, context, has_label=True
+                    entity_type, value, context, has_label=has_label
                 )
-                
-                # Use lower confidence threshold for account numbers to catch service accounts in tables
-                threshold = self.config.account_confidence_threshold if entity_type == EntityType.ACCOUNT_NUMBER else self.config.confidence_threshold
-                debug_log(f"    [DEBUG] Confidence: {confidence:.2f} (threshold: {threshold})")
+
+                threshold = (self.config.account_confidence_threshold
+                             if entity_type == EntityType.ACCOUNT_NUMBER
+                             else self.config.confidence_threshold)
+                debug_log(f"    [DEBUG] Confidence: {confidence:.2f} (threshold: {threshold}, has_label={has_label})")
 
                 if confidence >= threshold:
-                    # Normalize the value for consistent comparison
                     normalized_value = self._normalize_entity_value(entity_type, value)
                     entities.append(ValidatedEntity(
                         entity_type=entity_type,
@@ -976,11 +900,10 @@ class DocumentIntelligence:
                         context=context,
                         page_num=page_num,
                         position=(start, end),
-                        has_label=True
+                        has_label=has_label
                     ))
-                    debug_log(f"    [DEBUG] ACCEPTED: {entity_type.value}={normalized_value}")
+                    debug_log(f"    [DEBUG] ACCEPTED: {entity_type.value}='{normalized_value}' (conf={confidence:.2f})")
                 else:
-                    threshold = self.config.account_confidence_threshold if entity_type == EntityType.ACCOUNT_NUMBER else self.config.confidence_threshold
                     debug_log(f"    [DEBUG] REJECTED: Confidence {confidence:.2f} < {threshold}")
 
         debug_log(f"    [DEBUG] Total entities found on page {page_num}: {len(entities)}")
@@ -1167,37 +1090,45 @@ class DocumentIntelligence:
                                       context: str, has_label: bool) -> float:
         """
         Calculate confidence score for an entity based on multiple factors.
+
+        Format checks run on the *stripped* value (spaces and hyphens removed) so
+        that space-separated numbers like "6699 090" pass the alphanumeric check
+        and receive the +0.20 format bonus.
         """
         score = 0.0
+
+        # Stripped version used for format checks only (stored value is unchanged)
+        stripped = value.replace(' ', '').replace('-', '')
 
         # +0.35 if has explicit label (Account:, Meter No, etc.)
         if has_label:
             score += 0.35
 
-        # +0.20 for proper format (alphanumeric, reasonable length)
-        if re.match(r'^[A-Z0-9\-]+$', value, re.IGNORECASE):
-            if self.config.min_account_length <= len(value) <= self.config.max_account_length:
+        # +0.20 for proper format (alphanumeric after stripping spaces/hyphens)
+        if re.match(r'^[A-Z0-9]+$', stripped, re.IGNORECASE):
+            if self.config.min_account_length <= len(stripped) <= self.config.max_account_length:
                 score += 0.20
 
         # +0.15 if context contains supporting keywords
         context_lower = context.lower()
         supporting_keywords = ['service', 'billing', 'utility', 'electric',
-                              'water', 'gas', 'statement', 'charge']
+                               'water', 'gas', 'statement', 'charge',
+                               'account', 'meter', 'invoice']
         if any(kw in context_lower for kw in supporting_keywords):
             score += 0.15
 
-        # +0.15 if value looks like typical utility account format
-        # (mix of letters and numbers, or pure numbers with consistent length)
-        if (re.match(r'^\d{8,12}$', value) or  # Pure numeric 8-12 digits
-            re.match(r'^[A-Z]{2,4}\d{6,12}$', value, re.IGNORECASE)):  # Prefix + digits
+        # +0.15 if stripped value looks like a typical utility account/meter format
+        if (re.match(r'^\d{8,12}$', stripped) or                      # Pure numeric 8-12
+            re.match(r'^[A-Z]{2,4}\d{6,12}$', stripped, re.IGNORECASE) or  # Prefix+digits
+            re.match(r'^\d+(?:\s[0-9]+)+$', value)):                  # Space-separated e.g. "6699 090"
             score += 0.15
 
-        # +0.10 if not in a problematic context (footer, header patterns)
+        # +0.10 if not in a problematic context (footer, header, web/phone references)
         problematic_patterns = ['page', 'www.', 'http', '@', 'phone:', 'fax:']
         if not any(p in context_lower for p in problematic_patterns):
             score += 0.10
 
-        # -0.20 if appears to be a date or amount
+        # -0.20 if appears to be a date or dollar amount
         if re.match(r'^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$', value):
             score -= 0.20
         if re.match(r'^\$?\d+\.\d{2}$', value):
@@ -1205,13 +1136,228 @@ class DocumentIntelligence:
 
         return min(max(score, 0.0), 1.0)
 
+    def _extract_from_table_structure(self, text: str, page_num: int,
+                                       debug_callback=None) -> List[ValidatedEntity]:
+        """
+        Column-position-aware extraction for tabular layouts.
+
+        Handles the common utility-invoice table pattern where column headers
+        appear on one line and values appear on one or more subsequent lines,
+        aligned by character position:
+
+            Account Number    Meter Number    Service Address
+            6699 090          98765421        123 Main St, City, ST
+            789 012           54321098        456 Oak Ave, Town, CA
+
+        Algorithm:
+          1. Scan every line for 2+ known entity-label keywords.
+          2. Record each keyword's character-offset in the original line
+             as the column start position.
+          3. For up to 10 subsequent non-blank lines extract the text that
+             falls within each column's character range and validate it as
+             the corresponding entity type.
+        """
+        entities: List[ValidatedEntity] = []
+
+        def debug_log(msg):
+            if debug_callback:
+                debug_callback(msg)
+
+        # Ordered longest-first so multi-word keywords win over single-word ones
+        COLUMN_HEADERS: List[Tuple[str, EntityType]] = [
+            ('account number',   EntityType.ACCOUNT_NUMBER),
+            ('account no',       EntityType.ACCOUNT_NUMBER),
+            ('account nbr',      EntityType.ACCOUNT_NUMBER),
+            ('account #',        EntityType.ACCOUNT_NUMBER),
+            ('member account',   EntityType.ACCOUNT_NUMBER),
+            ('member acct',      EntityType.ACCOUNT_NUMBER),
+            ('customer account', EntityType.ACCOUNT_NUMBER),
+            ('service account',  EntityType.ACCOUNT_NUMBER),
+            ('acct number',      EntityType.ACCOUNT_NUMBER),
+            ('acct no',          EntityType.ACCOUNT_NUMBER),
+            ('acct nbr',         EntityType.ACCOUNT_NUMBER),
+            ('acct #',           EntityType.ACCOUNT_NUMBER),
+            ('meter number',     EntityType.METER_NUMBER),
+            ('meter no',         EntityType.METER_NUMBER),
+            ('meter nbr',        EntityType.METER_NUMBER),
+            ('meter #',          EntityType.METER_NUMBER),
+            ('point of delivery', EntityType.POD_ID),
+            ('pod id',           EntityType.POD_ID),
+            ('ldc number',       EntityType.LDC_NUMBER),
+            ('ldc no',           EntityType.LDC_NUMBER),
+            ('supplier number',  EntityType.SUPPLIER_NUMBER),
+            ('supplier no',      EntityType.SUPPLIER_NUMBER),
+            ('service address',  EntityType.SERVICE_ADDRESS),
+            ('service location', EntityType.SERVICE_ADDRESS),
+            ('service site',     EntityType.SERVICE_ADDRESS),
+            ('invoice number',   EntityType.INVOICE_NUMBER),
+            ('invoice no',       EntityType.INVOICE_NUMBER),
+            ('invoice nbr',      EntityType.INVOICE_NUMBER),
+            ('invoice #',        EntityType.INVOICE_NUMBER),
+            ('customer number',  EntityType.CUSTOMER_NUMBER),
+            ('customer no',      EntityType.CUSTOMER_NUMBER),
+            ('customer id',      EntityType.CUSTOMER_ID),
+            ('contract number',  EntityType.CONTRACT_NUMBER),
+            ('contract no',      EntityType.CONTRACT_NUMBER),
+            ('premise number',   EntityType.PREMISE_NUMBER),
+            ('premise no',       EntityType.PREMISE_NUMBER),
+            ('premise id',       EntityType.PREMISE_ID),
+            ('esi id',           EntityType.ESI_ID),
+            ('budget number',    EntityType.BUDGET_NUMBER),
+            ('budget no',        EntityType.BUDGET_NUMBER),
+            ('budget nbr',       EntityType.BUDGET_NUMBER),
+            # Single-word fallbacks (must come last)
+            ('account',          EntityType.ACCOUNT_NUMBER),
+            ('acct',             EntityType.ACCOUNT_NUMBER),
+            ('meter',            EntityType.METER_NUMBER),
+            ('pod',              EntityType.POD_ID),
+            ('ldc',              EntityType.LDC_NUMBER),
+            ('supplier',         EntityType.SUPPLIER_NUMBER),
+            ('customer',         EntityType.CUSTOMER_NUMBER),
+            ('invoice',          EntityType.INVOICE_NUMBER),
+            ('contract',         EntityType.CONTRACT_NUMBER),
+            ('premise',          EntityType.PREMISE_NUMBER),
+        ]
+
+        lines = text.split('\n')
+
+        for line_idx, line in enumerate(lines):
+            line_lower = line.lower()
+
+            # Skip blank or very short lines
+            if len(line.strip()) < 6:
+                continue
+
+            # Skip lines that are mostly digits — they are data rows, not header rows
+            alpha_count = sum(1 for c in line if c.isalpha())
+            if alpha_count < max(4, len(line.strip()) * 0.25):
+                continue
+
+            # ── Find column headers in this line ────────────────────────────
+            occupied: List[Tuple[int, int]] = []   # (start, end) of matched regions
+            header_cols: List[Tuple[int, EntityType, str]] = []  # (orig_char_pos, type, kw)
+
+            for keyword, entity_type in COLUMN_HEADERS:
+                search_from = 0
+                while True:
+                    pos = line_lower.find(keyword, search_from)
+                    if pos < 0:
+                        break
+                    end_pos = pos + len(keyword)
+                    # Only accept if not already claimed by a longer keyword
+                    if not any(pos < oe and end_pos > os for os, oe in occupied):
+                        header_cols.append((pos, entity_type, keyword))
+                        occupied.append((pos, end_pos))
+                    search_from = pos + 1
+
+            # Need at least 2 distinct column headers
+            if len(header_cols) < 2:
+                continue
+
+            header_cols.sort(key=lambda x: x[0])
+            debug_log(f"    [TABLE] Header row {line_idx}: "
+                      f"{[(kw, et.value) for _, et, kw in header_cols]}")
+
+            # ── Extract values from subsequent data lines ────────────────────
+            for data_idx in range(line_idx + 1, min(line_idx + 10, len(lines))):
+                data_line = lines[data_idx]
+                data_stripped = data_line.strip()
+
+                if not data_stripped:
+                    continue
+
+                # Stop if we hit another header-like line (mostly alpha, no digits)
+                data_alpha = sum(1 for c in data_stripped if c.isalpha())
+                data_has_digits = any(c.isdigit() for c in data_stripped)
+                if data_alpha > len(data_stripped) * 0.75 and not data_has_digits:
+                    break
+
+                for col_idx, (col_start, entity_type, keyword) in enumerate(header_cols):
+                    # Column end = start of next column header (or end of line)
+                    col_end = (header_cols[col_idx + 1][0]
+                               if col_idx + 1 < len(header_cols)
+                               else len(data_line) + 200)
+
+                    if col_start >= len(data_line):
+                        # Column position is beyond data line length → token fallback
+                        tokens = data_stripped.split()
+                        col_value = tokens[col_idx] if col_idx < len(tokens) else ''
+                    else:
+                        raw_col = data_line[col_start:col_end].strip()
+                        if not raw_col:
+                            continue
+
+                        # For identifier columns: take the first "token group"
+                        # Allow space-separated numbers like "6699 090"
+                        if entity_type not in (EntityType.SERVICE_ADDRESS,
+                                               EntityType.BILLING_ADDRESS):
+                            col_tokens = raw_col.split()
+                            if not col_tokens:
+                                continue
+                            # Greedily accumulate tokens that look like parts of a
+                            # space-separated identifier (e.g. "6699 090")
+                            col_value = col_tokens[0]
+                            for extra in col_tokens[1:]:
+                                if re.match(r'^[0-9]+$', extra) and len(col_value) < 20:
+                                    col_value = col_value + ' ' + extra
+                                else:
+                                    break
+                        else:
+                            col_value = raw_col
+
+                    if not col_value:
+                        continue
+
+                    if not self._validate_entity_value(entity_type, col_value):
+                        debug_log(f"    [TABLE] Rejected '{col_value}' for {entity_type.value}")
+                        continue
+
+                    # Build context from header line + data line
+                    context_str = line + '\n' + data_line
+
+                    confidence = self._calculate_entity_confidence(
+                        entity_type, col_value, context_str, has_label=True
+                    )
+                    threshold = (self.config.account_confidence_threshold
+                                 if entity_type == EntityType.ACCOUNT_NUMBER
+                                 else self.config.confidence_threshold)
+
+                    if confidence >= threshold:
+                        normalized = self._normalize_entity_value(entity_type, col_value)
+
+                        # Approximate character position in original text
+                        line_pos = text.find(data_line)
+                        pos_start = (line_pos + col_start) if line_pos >= 0 else 0
+                        pos_end   = pos_start + len(col_value)
+
+                        entities.append(ValidatedEntity(
+                            entity_type=entity_type,
+                            value=normalized,
+                            raw_value=col_value,
+                            confidence=confidence,
+                            context=context_str[:300],
+                            page_num=page_num,
+                            position=(pos_start, pos_end),
+                            has_label=True,
+                        ))
+                        debug_log(f"    [TABLE] ACCEPTED {entity_type.value}='{normalized}' "
+                                  f"from col '{keyword}' (conf={confidence:.2f})")
+
+        return entities
+
     def _merge_entities(self, list1: List[ValidatedEntity],
                         list2: List[ValidatedEntity]) -> List[ValidatedEntity]:
-        """Merge two entity lists, keeping highest confidence for duplicates"""
+        """Merge two entity lists, keeping highest confidence for duplicates.
+
+        Deduplication key uses a normalised value (spaces and hyphens stripped,
+        uppercased) so "6699 090", "6699090", and "6699-090" all collapse to the
+        same entity — keeping the highest-confidence representation.
+        """
         entity_map = {}
 
         for entity in list1 + list2:
-            key = (entity.entity_type, entity.value, entity.page_num)
+            norm = entity.value.upper().replace(' ', '').replace('-', '')
+            key = (entity.entity_type, norm, entity.page_num)
             if key not in entity_map or entity.confidence > entity_map[key].confidence:
                 entity_map[key] = entity
 
@@ -2723,6 +2869,18 @@ class InvoiceSplitter:
             ttk.Label(settings_frame, text="(Tesseract not found)",
                      foreground="gray", font=('Arial', 8)).grid(row=0, column=4, sticky=tk.W)
 
+        # Anchor List Override field
+        ttk.Label(settings_frame, text="Anchor Entity List:",
+                 font=('Arial', 9)).grid(row=1, column=0, sticky=tk.W, padx=(5, 2), pady=(5, 2))
+        self.anchor_list_var = tk.StringVar(value="")
+        self.anchor_list_entry = ttk.Entry(settings_frame, textvariable=self.anchor_list_var, width=60)
+        self.anchor_list_entry.grid(row=1, column=1, columnspan=4, sticky=(tk.W, tk.E), padx=2, pady=(5, 2))
+        ttk.Label(settings_frame,
+                 text="Pipe-separated entity values for override split  e.g. 123456|98765|ABC001  "
+                      "(leave blank to use NLP mode)",
+                 foreground="gray", font=('Arial', 8)).grid(row=2, column=1, columnspan=4, sticky=tk.W, padx=2)
+        settings_frame.columnconfigure(1, weight=1)
+
         # Keep include_summary for backward compatibility but set based on invoice type
         self.include_summary = tk.BooleanVar(value=True)
 
@@ -3731,11 +3889,203 @@ class InvoiceSplitter:
 
         return result['type']
 
+    def _anchor_list_split(self, anchor_text: str) -> List[dict]:
+        """
+        Anchor List Override Split (SplitStrategy.ANCHOR_LIST_OVERRIDE).
+
+        Rules:
+        - Bypasses ALL NLP validation and confidence scoring.
+        - Exact word-boundary match: \\b{re.escape(entity)}\\b  (case-insensitive).
+        - Each entity → its own output split containing EVERY page where it appears.
+        - A page may belong to multiple splits if multiple entities appear on it.
+        - Entities not found anywhere in the PDF are listed with 'found=False'.
+        - No carry-forward, no page inheritance, no NLP re-run.
+        - Input is deduplicated (case-insensitive) while preserving first-seen order.
+
+        Returns list of dicts:
+            {'entity': str, 'pages': List[int], 'found': bool}
+        """
+        if not self.pdf_path:
+            return []
+
+        # 1. Parse and deduplicate input (preserve order)
+        raw_items = [e.strip() for e in anchor_text.split('|') if e.strip()]
+        seen_keys: set = set()
+        entities: List[str] = []
+        for item in raw_items:
+            key = item.upper()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                entities.append(item)
+
+        if not entities:
+            return []
+
+        # 2. Compile one regex per entity (word-boundary, case-insensitive)
+        patterns = {
+            e: re.compile(rf"\b{re.escape(e)}\b", re.IGNORECASE)
+            for e in entities
+        }
+
+        # 3. Use already-analysed page texts (includes OCR output for scanned PDFs).
+        #    Fall back to pdfplumber only when anchor override is used without Analyze.
+        if self.pages_data:
+            pages_text: List[Tuple[int, str]] = [
+                (pd.page_num, pd.text) for pd in self.pages_data
+            ]
+            self.log("  [Anchor Override] Using OCR-processed text from Analyze step")
+        else:
+            pages_text = []
+            try:
+                with pdfplumber.open(self.pdf_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        text = page.extract_text() or ""
+                        pages_text.append((i + 1, text))
+                self.log("  [Anchor Override] Using pdfplumber text (no OCR — run Analyze first for scanned PDFs)")
+            except Exception as exc:
+                self.log(f"  [Anchor Override] Error reading PDF: {exc}")
+                return []
+
+        # 4. Match each entity against every page
+        entity_page_map: Dict[str, List[int]] = {e: [] for e in entities}
+        for page_num, page_text in pages_text:
+            for entity in entities:
+                if patterns[entity].search(page_text):
+                    entity_page_map[entity].append(page_num)
+
+        # 5. Build result list
+        results = []
+        for entity in entities:
+            pages = sorted(entity_page_map[entity])
+            results.append({
+                'entity': entity,
+                'pages': pages,
+                'found': len(pages) > 0,
+            })
+        return results
+
+    def _preview_anchor_override(self, anchor_text: str):
+        """
+        Render the preview panel for ANCHOR_LIST_OVERRIDE strategy.
+        Called by preview_split() when the Anchor Entity List field is non-empty.
+        """
+        self.update_status("Running Anchor List Override...")
+        self.log("\n" + "=" * 50)
+        self.log("ANCHOR LIST OVERRIDE SPLIT")
+        self.log("=" * 50)
+        self.log(f"  Strategy: {SplitStrategy.ANCHOR_LIST_OVERRIDE.name}")
+        self.log(f"  Input: {anchor_text}")
+
+        # Clear preview
+        for item in self.preview_tree.get_children():
+            self.preview_tree.delete(item)
+        self.split_selection = {}
+        self.split_results = []
+
+        try:
+            original_name = Path(self.pdf_path).stem
+            anchor_results = self._anchor_list_split(anchor_text)
+
+            if not anchor_results:
+                messagebox.showwarning("Empty Anchor List",
+                    "No valid entity values found in the Anchor Entity List field.\n"
+                    "Use pipe | to separate multiple values, e.g. 123456|98765|ABC001")
+                self.update_status("Anchor override cancelled — empty list.")
+                return
+
+            # Collect summary pages to prepend when Invoice Type = "Summary Account"
+            summary_pages: List[int] = []
+            if self.invoice_type.get() == "summary" and self.document_structure:
+                summary_pages = self.document_structure.get('summary_pages', [])
+                if summary_pages:
+                    self.log(f"  Invoice Type: SUMMARY — prepending pages {summary_pages} to each found split")
+                else:
+                    self.log("  Invoice Type: SUMMARY — no summary pages detected in document structure")
+
+            found_count = 0
+            not_found_count = 0
+
+            for result in anchor_results:
+                entity = result['entity']
+                raw_pages = result['pages']
+                found = result['found']
+
+                # Apply summary page prepend (same logic as IntelligentSplitter)
+                if found and summary_pages:
+                    pages = sorted(set(raw_pages) | set(summary_pages))
+                else:
+                    pages = raw_pages
+
+                # Build a clean filename from entity value
+                clean_id = re.sub(r'[^\w\-]', '_', entity)[:50]
+                filename = f"{original_name}_{clean_id}.pdf"
+
+                self.split_results.append(SplitResult(
+                    filename=filename,
+                    pages=pages,
+                    primary_identifier=entity,
+                    identifier_type="Anchor Override",
+                    confidence=1.0 if found else 0.0,
+                ))
+
+                if found:
+                    if len(pages) > 5:
+                        pages_str = f"{pages[0]}-{pages[-1]} ({len(pages)} pages)"
+                    else:
+                        pages_str = ", ".join(map(str, pages))
+
+                    item_id = self.preview_tree.insert('', 'end', values=(
+                        '✓',
+                        filename,
+                        pages_str,
+                        entity,
+                        'Anchor Override',
+                        '100%'
+                    ))
+                    self.split_selection[item_id] = True
+                    self.log(f"  FOUND     {entity}  →  pages {pages_str}")
+                    found_count += 1
+                else:
+                    item_id = self.preview_tree.insert('', 'end', values=(
+                        '—',
+                        f"{entity}  [Not Found]",
+                        '—',
+                        entity,
+                        'Anchor Override',
+                        'N/A'
+                    ))
+                    self.log(f"  NOT FOUND {entity}")
+                    not_found_count += 1
+
+            self._update_selected_count()
+
+            self.log(f"\n  Result: {found_count} entities found, {not_found_count} not found")
+            self.update_status(
+                f"Anchor Override ready — {found_count} found, {not_found_count} not found. "
+                "Click 'Include' to select/deselect."
+            )
+            self.notebook.select(2)  # Switch to preview tab
+
+        except Exception as exc:
+            self.log(f"ERROR in anchor override preview: {exc}")
+            import traceback
+            self.log(traceback.format_exc())
+            messagebox.showerror("Error", f"Anchor Override preview failed: {exc}")
+
     def preview_split(self):
         """Generate split preview with user-selected entity type"""
         if not self.pages_data:
             messagebox.showerror("Error", "Please analyze PDF first")
             return
+
+        # ── ANCHOR LIST OVERRIDE ──────────────────────────────────────────────
+        # If the user has filled in the Anchor Entity List field, bypass NLP
+        # entirely and use exact word-boundary matching instead.
+        anchor_text = self.anchor_list_var.get().strip()
+        if anchor_text:
+            self._preview_anchor_override(anchor_text)
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         # Show entity type selection dialog
         selected_type = self._show_split_type_dialog()
